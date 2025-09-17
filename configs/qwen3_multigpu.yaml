@@ -1,9 +1,8 @@
 # Multi-GPU Fine-tuning Configuration for 2x RTX 4090 24GB
-# Optimized for FSDP and Unsloth
 
 model:
   name: "Qwen/Qwen3-4B-Instruct-2507"
-  max_seq_length: 1024  # Reduced from 2048 for better memory efficiency
+  max_seq_length: 8192  # Reduced from 2048 for better memory efficiency
   load_in_4bit: true
   load_in_8bit: false
   full_finetuning: false
@@ -59,7 +58,7 @@ training:
   per_device_eval_batch_size: 2 
   
   # Wandb configuration
-  wandb_project: "qwen3-finetune-multigpu"
+  wandb_project: "qwen3-finetune"
   wandb_entity: null
   
   # Multi-GPU specific settings - Memory optimized
