@@ -489,6 +489,61 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
     return dataloader
 
 
+def get_eval_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
+    """Creates a validation dataset and dataloader with distributed sampler."""
+    from datasets import Dataset, load_dataset
+
+    eval_samples = max(1, int(args.get("eval_samples", 256)))
+
+    if args["dataset"] == "sql":
+        dataset = load_dataset("knowrohit07/know_sql")["validation"]
+        dataset = dataset.select(range(0, min(1000, len(dataset))))
+        dataset = InstructionDataset(dataset, tokenizer, style="qna")
+    elif args["dataset"] == "alpaca_sample":
+        base = load_dataset("yahma/alpaca-cleaned", split=f"train")
+        start = min(len(base), args["dataset_samples"])  # start after the train slice
+        end = min(len(base), start + eval_samples)
+        if start >= end:
+            start, end = 0, min(eval_samples, len(base))
+        dataset = base.select(range(start, end))
+        dataset = InstructionDataset(dataset, tokenizer, style="alpaca")
+    elif args["dataset"] == "alpaca":
+        base = load_dataset("yahma/alpaca-cleaned")["train"]
+        dataset = base.select(range(0, min(eval_samples, len(base))))
+        dataset = InstructionDataset(dataset, tokenizer, style="alpaca")
+    elif args["dataset"] == "guanaco":
+        base = load_dataset("timdettmers/openassistant-guanaco", split="train")
+        dataset = base.select(range(0, min(eval_samples, len(base))))
+        dataset = InstructionDataset(dataset, tokenizer, style="guanaco")
+    elif args["dataset"] == "orca_math":
+        base = load_dataset("microsoft/orca-math-word-problems-200k")["train"].shuffle(seed=args["seed"]) 
+        dataset = base.select(range(0, min(eval_samples, len(base))))
+        dataset = InstructionDataset(dataset, tokenizer, style="qna_no_ctx")
+    else:
+        dataset = Dataset.from_dict({
+            'instruction': ["instruction"]*eval_samples,
+            'input': ["input"]*eval_samples,
+            'output': ["output"*args["context_length"]]*eval_samples,
+        })
+        dataset = InstructionDataset(dataset, tokenizer, style="alpaca")
+
+    def collate_fn(batch, with_attention_mask=False):
+        input_ids = [torch.tensor(item['input_ids']) for item in batch]
+        attention_masks = [torch.tensor(item['attention_mask']) for item in batch]
+        labels = [torch.tensor(item['labels']) for item in batch]
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)[:, :args["context_length"]]
+        if with_attention_mask:
+            attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)[:, :args["context_length"]]
+        else:
+            attention_masks = None
+        labels = pad_sequence(labels, batch_first=True, padding_value=-100)[:, :args["context_length"]]
+        return {'input_ids': input_ids, 'attention_mask': attention_masks, 'labels': labels}
+
+    sampler = DistributedSampler(dataset, seed=args["seed"], shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=args["batch_size"], collate_fn=collate_fn, sampler=sampler)
+    return dataloader
+
+
 # LR scheduler.
 def _get_cosine_one_cycle_lr_lambda(
     current_step: int, *, num_warmup_steps: int, num_training_steps: int, min_lr_fraction = 0.1,
@@ -643,6 +698,11 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
     # Set up dataloader
     dataloader = get_dataloader(tokenizer, args)
+
+    # Set up evaluation dataloader if enabled
+    eval_dataloader = None
+    if int(args.get("eval_every_steps", 0)) > 0:
+        eval_dataloader = get_eval_dataloader(tokenizer, args)
 
 
     # Create model
@@ -926,6 +986,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     log_loss, log_lr = 0.0, -1
     # Reset peak memory to track that
     torch.cuda.reset_peak_memory_stats(local_rank)
+    global_step = 0
     with profiling_context(args, rank=rank) as prof:
         for epoch in range(args['num_epochs']):
             update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
@@ -1002,6 +1063,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     if lr_scheduler is not None:
                         lr_scheduler.step()
                     progress_bar.update(1)
+                    global_step += 1
 
                 # Log memory usage after backward
                 if batch_idx == 0 and epoch == 0 and (rank == 0 or args['verbose']):
@@ -1031,13 +1093,39 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                             log_lr = args["lr"]
                         update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
                         if args["log_to"] == 'wandb':
-                            logger.log({"loss": log_loss, "lr": log_lr}, rank)
+                            logger.log({"loss": log_loss, "lr": log_lr, "step": global_step}, rank)
                     ddp_loss = torch.zeros(2).to(local_rank)
 
                 if rank == 0 and args['verbose']:
                     print(f"Batch idx {batch_idx}")
 
                 prof.step()
+
+                # Run validation every N steps, after gradient update
+                if accumulate_grads and eval_dataloader is not None and int(args.get("eval_every_steps", 0)) > 0 and (global_step % int(args.get("eval_every_steps", 0)) == 0):
+                    # Local validation function defined earlier in this scope
+                    def _run_validation(current_step:int):
+                        model.eval()
+                        ddp_eval = torch.zeros(2, device=local_rank)
+                        with torch.no_grad():
+                            for batch in eval_dataloader:
+                                with (torch.cuda.amp.autocast(enabled=True, dtype=compute_dtype) if args["precision"] in ["fp16_autocast", "bf16_autocast", "bf16_buffers_autocast"] else nullcontext()):
+                                    output = model(
+                                        batch['input_ids'].to(local_rank),
+                                        labels=batch['labels'].to(local_rank),
+                                        attention_mask=None,
+                                    )
+                                    loss = output.loss
+                                bs = batch['input_ids'].shape[0]
+                                ddp_eval[0] += loss.item() * bs
+                                ddp_eval[1] += bs
+                        dist.all_reduce(ddp_eval, op=dist.ReduceOp.SUM)
+                        if rank == 0:
+                            eval_loss = (ddp_eval[0] / ddp_eval[1]).item() if ddp_eval[1] > 0 else float('nan')
+                            eval_ppl = math.exp(eval_loss) if eval_loss < 20 else float('inf')
+                            logger.log({"eval/loss": eval_loss, "eval/ppl": eval_ppl, "step": current_step}, rank)
+                        model.train()
+                    _run_validation(global_step)
 
                 #Primarily for debugging
                 if args["max_steps"] > 0 and batch_idx > args["max_steps"]:
