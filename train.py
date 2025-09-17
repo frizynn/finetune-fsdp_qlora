@@ -83,16 +83,49 @@ except ImportError:
 
 # To add a new model, import the transformer, attention, & MLP layers
 # for the wrapping policy and `check_fn` in activation checkpointing
-from transformers.models.llama.modeling_llama import (
-    LLAMA_ATTENTION_CLASSES,
-    LlamaDecoderLayer,
-    LlamaMLP,
-)
-from transformers.models.mistral.modeling_mistral import (
-    MISTRAL_ATTENTION_CLASSES,
-    MistralDecoderLayer,
-    MistralMLP,
-)
+try:
+    from transformers.models.llama.modeling_llama import (
+        LLAMA_ATTENTION_CLASSES,
+        LlamaDecoderLayer,
+        LlamaMLP,
+    )
+except Exception:
+    # Fallback for Transformers versions where LLAMA_ATTENTION_CLASSES is not defined
+    LLAMA_ATTENTION_CLASSES = {}
+    try:
+        import importlib
+        _llama_mod = importlib.import_module("transformers.models.llama.modeling_llama")
+        for _name in ("LlamaAttention", "LlamaSdpaAttention", "LlamaFlashAttention2"):
+            _cls = getattr(_llama_mod, _name, None)
+            if _cls is not None:
+                LLAMA_ATTENTION_CLASSES[_name] = _cls
+        LlamaDecoderLayer = getattr(_llama_mod, "LlamaDecoderLayer", tuple())
+        LlamaMLP = getattr(_llama_mod, "LlamaMLP", tuple())
+    except Exception:
+        LlamaDecoderLayer = tuple()
+        LlamaMLP = tuple()
+
+try:
+    from transformers.models.mistral.modeling_mistral import (
+        MISTRAL_ATTENTION_CLASSES,
+        MistralDecoderLayer,
+        MistralMLP,
+    )
+except Exception:
+    # Fallback for Transformers versions where MISTRAL_ATTENTION_CLASSES is not defined
+    MISTRAL_ATTENTION_CLASSES = {}
+    try:
+        import importlib
+        _mistral_mod = importlib.import_module("transformers.models.mistral.modeling_mistral")
+        for _name in ("MistralAttention", "MistralSdpaAttention", "MistralFlashAttention2"):
+            _cls = getattr(_mistral_mod, _name, None)
+            if _cls is not None:
+                MISTRAL_ATTENTION_CLASSES[_name] = _cls
+        MistralDecoderLayer = getattr(_mistral_mod, "MistralDecoderLayer", tuple())
+        MistralMLP = getattr(_mistral_mod, "MistralMLP", tuple())
+    except Exception:
+        MistralDecoderLayer = tuple()
+        MistralMLP = tuple()
 
 # Optional: Qwen2/Qwen3 support (import if available)
 try:
@@ -102,9 +135,20 @@ try:
         Qwen2MLP,
     )
 except Exception:
+    # Fallback construction for Qwen2
     QWEN2_ATTENTION_CLASSES = {}
-    Qwen2DecoderLayer = tuple()
-    Qwen2MLP = tuple()
+    try:
+        import importlib
+        _qwen2_mod = importlib.import_module("transformers.models.qwen2.modeling_qwen2")
+        for _name in ("Qwen2Attention", "Qwen2SdpaAttention", "Qwen2FlashAttention2"):
+            _cls = getattr(_qwen2_mod, _name, None)
+            if _cls is not None:
+                QWEN2_ATTENTION_CLASSES[_name] = _cls
+        Qwen2DecoderLayer = getattr(_qwen2_mod, "Qwen2DecoderLayer", tuple())
+        Qwen2MLP = getattr(_qwen2_mod, "Qwen2MLP", tuple())
+    except Exception:
+        Qwen2DecoderLayer = tuple()
+        Qwen2MLP = tuple()
 try:
     from transformers.models.qwen3.modeling_qwen3 import (
         QWEN3_ATTENTION_CLASSES,
@@ -112,9 +156,20 @@ try:
         Qwen3MLP,
     )
 except Exception:
+    # Fallback construction for Qwen3
     QWEN3_ATTENTION_CLASSES = {}
-    Qwen3DecoderLayer = tuple()
-    Qwen3MLP = tuple()
+    try:
+        import importlib
+        _qwen3_mod = importlib.import_module("transformers.models.qwen3.modeling_qwen3")
+        for _name in ("Qwen3Attention", "Qwen3SdpaAttention", "Qwen3FlashAttention2"):
+            _cls = getattr(_qwen3_mod, _name, None)
+            if _cls is not None:
+                QWEN3_ATTENTION_CLASSES[_name] = _cls
+        Qwen3DecoderLayer = getattr(_qwen3_mod, "Qwen3DecoderLayer", tuple())
+        Qwen3MLP = getattr(_qwen3_mod, "Qwen3MLP", tuple())
+    except Exception:
+        Qwen3DecoderLayer = tuple()
+        Qwen3MLP = tuple()
 
 # To get rid of tokenizers warnings for now
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
