@@ -94,6 +94,28 @@ from transformers.models.mistral.modeling_mistral import (
     MistralMLP,
 )
 
+# Optional: Qwen2/Qwen3 support (import if available)
+try:
+    from transformers.models.qwen2.modeling_qwen2 import (
+        QWEN2_ATTENTION_CLASSES,
+        Qwen2DecoderLayer,
+        Qwen2MLP,
+    )
+except Exception:
+    QWEN2_ATTENTION_CLASSES = {}
+    Qwen2DecoderLayer = tuple()
+    Qwen2MLP = tuple()
+try:
+    from transformers.models.qwen3.modeling_qwen3 import (
+        QWEN3_ATTENTION_CLASSES,
+        Qwen3DecoderLayer,
+        Qwen3MLP,
+    )
+except Exception:
+    QWEN3_ATTENTION_CLASSES = {}
+    Qwen3DecoderLayer = tuple()
+    Qwen3MLP = tuple()
+
 # To get rid of tokenizers warnings for now
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -481,18 +503,25 @@ def get_wrapping_policy(custom_policy:bool=False, vanilla_policy:bool=False):
             )
     def self_attn_policy_fn(module):
         # Check module name is self_attn.
-        return isinstance(module, tuple((*LLAMA_ATTENTION_CLASSES.values(), *MISTRAL_ATTENTION_CLASSES.values())))
+        return isinstance(module, tuple((*LLAMA_ATTENTION_CLASSES.values(), *MISTRAL_ATTENTION_CLASSES.values(), *getattr(QWEN2_ATTENTION_CLASSES, 'values', lambda: [])(), *getattr(QWEN3_ATTENTION_CLASSES, 'values', lambda: [])())))
 
     def mlp_policy_fn(module):
         # Check module name is self_attn.
-        return isinstance(module, (LlamaMLP, MistralMLP))
+        qwen_mlps = tuple([cls for cls in (Qwen2MLP if isinstance(Qwen2MLP, type) else ())]) if False else ()
+        qwen3_mlps = tuple([cls for cls in (Qwen3MLP if isinstance(Qwen3MLP, type) else ())]) if False else ()
+        return isinstance(module, (LlamaMLP, MistralMLP, *(() if not isinstance(Qwen2MLP, type) else (Qwen2MLP,)), *(() if not isinstance(Qwen3MLP, type) else (Qwen3MLP,))))
 
     lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
     self_attn_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=self_attn_policy_fn)
     mlp_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=mlp_policy_fn)
     transformer_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls=(LlamaDecoderLayer, MistralDecoderLayer),
+        transformer_layer_cls=tuple(filter(None, (
+            LlamaDecoderLayer,
+            MistralDecoderLayer,
+            (Qwen2DecoderLayer if isinstance(Qwen2DecoderLayer, type) else None),
+            (Qwen3DecoderLayer if isinstance(Qwen3DecoderLayer, type) else None),
+        ))),
     )
     if vanilla_policy:
         return transformer_wrap_policy
@@ -554,7 +583,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args["model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(args["model_name"], trust_remote_code=("qwen" in args["model_name"].lower()))
     tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
     # Set up dataloader
@@ -572,12 +601,13 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 args["model_name"],
                 use_cache=False,
                 torch_dtype=torch_dtype,
-                _attn_implementation=attn_impl
+                _attn_implementation=attn_impl,
+                trust_remote_code=("qwen" in args["model_name"].lower()),
             )
             dtype = torch_dtype if args["precision"] == "bf16" else None
             model.to(dtype=dtype, device="cpu" if args["low_memory"] else rank)
         else:
-            cfg = AutoConfig.from_pretrained(args["model_name"])
+            cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=("qwen" in args["model_name"].lower()))
             cfg.use_cache = False
             cfg._attn_implementation = attn_impl
             with init_empty_weights():
@@ -585,7 +615,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             if args["precision"] == "bf16":
                 model.to(torch_dtype)
     elif args["train_type"] in ["qlora", "custom_qlora", "hqq_lora", "hqq_dora", "bnb_dora", "bnb_llama_pro", "hqq_llama_pro"]: # Our custom loading
-        cfg = AutoConfig.from_pretrained(args["model_name"])
+        cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=("qwen" in args["model_name"].lower()))
         cfg.use_cache = False
         cfg._attn_implementation = attn_impl
         skip_modules = ["lm_head"]
@@ -784,7 +814,12 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
         )
 
-        check_fn = lambda submodule: isinstance(submodule, (LlamaDecoderLayer, MistralDecoderLayer))
+        check_fn = lambda submodule: isinstance(submodule, tuple(filter(None, (
+            LlamaDecoderLayer,
+            MistralDecoderLayer,
+            (Qwen2DecoderLayer if isinstance(Qwen2DecoderLayer, type) else None),
+            (Qwen3DecoderLayer if isinstance(Qwen3DecoderLayer, type) else None),
+        ))))
         if rank == 0 or args['verbose']:
             print("Applying activation checkpointing", rank)
         apply_activation_checkpointing(

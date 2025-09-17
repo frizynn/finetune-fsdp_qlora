@@ -1,0 +1,70 @@
+# Multi-GPU Fine-tuning Configuration for 2x RTX 4090 24GB
+# Optimized for FSDP and Unsloth
+
+model:
+  name: "Qwen/Qwen3-4B-Instruct-2507"
+  max_seq_length: 1024  # Reduced from 2048 for better memory efficiency
+  load_in_4bit: true
+  load_in_8bit: false
+  full_finetuning: false
+  dtype: null # auto detect
+  
+  # LoRA configuration optimized for multi-GPU
+  lora_r: 8  # Reduced from 16 to save memory
+  lora_alpha: 16
+  lora_dropout: 0.1
+  use_rslora: true
+  target_modules:
+    - "q_proj"
+    - "k_proj" 
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+data:
+  train_path: "data/processed/train.jsonl"
+  validation_path: "data/processed/validation.jsonl"
+  text_field: "text"
+  instruction_field: "instruction"
+  response_field: "response"
+  prompt_template: "default"
+  dataset_format: "auto"
+  chatml_format: true
+
+training:
+  output_dir: "outputs/qwen3_multigpu"
+  per_device_train_batch_size: 3  
+  gradient_accumulation_steps: 6  
+  warmup_steps: 50
+  max_steps: 1000
+  learning_rate: 2.0e-5
+  fp16: false  # force disable fp16
+  bf16: true   # enable bf16 to match bnb storage
+  logging_steps: 10
+  optim: "adamw_torch_fused"
+  weight_decay: 0.05
+  lr_scheduler_type: "cosine"
+  seed: 3407
+  report_to: "wandb"
+  save_strategy: "no"
+  save_steps: 100
+  save_total_limit: 3
+  packing: false
+  dataset_num_proc: 4
+  
+  # Evaluation configuration
+  eval_steps: 100
+  per_device_eval_batch_size: 2 
+  
+  # Wandb configuration
+  wandb_project: "qwen3-finetune-multigpu"
+  wandb_entity: null
+  
+  # Multi-GPU specific settings - Memory optimized
+  ddp_find_unused_parameters: false
+  dataloader_num_workers: 4  # Reduced from 4 to save memory
+  dataloader_pin_memory: true  # Disabled to save memory
+  remove_unused_columns: true
+  use_gradient_checkpointing: "trainer"  # Enable gradient checkpointing via Transformers

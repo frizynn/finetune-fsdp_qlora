@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finetune-fsdp-qlora"
+version = "0.1.0"
+description = "FSDP + (Q)LoRA training utilities and scripts"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.13"
+authors = [
+  { name = "Answer.AI" }
+]
+keywords = ["fsdp", "lora", "qlora", "training", "transformers", "pytorch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+]
+
+dependencies = [
+  "torch>=2.2",
+  "accelerate>=0.26",
+  "transformers>=4.40",
+  "datasets>=2.17",
+  "safetensors>=0.4",
+  "bitsandbytes>=0.43",
+  "fastcore>=1.5",
+  "packaging>=24.0",
+  "tqdm>=4.66",
+  "peft>=0.11",
+  "trl>=0.8",
+  "sentencepiece>=0.1",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb>=0.16"]
+hqq = ["hqq>=0.1"]
+dev = [
+  "pytest>=8",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "ipykernel>=6",
+]
+
+[project.scripts]
+fsdp-qlora = "train:main"
+
+[tool.setuptools]
+# We ship top-level modules and the `scripts` package
+py-modules = ["train", "hf_train"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scripts*"]
+
+[tool.uv]
+
+[tool.uv.pip]
+# extra-index-url = ["https://download.pytorch.org/whl/cu121"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
