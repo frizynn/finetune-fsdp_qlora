@@ -1269,6 +1269,9 @@ def fsdp_qlora(
     repeat: int = 0, #Number of profiler cycles (wait + warmup + active) if > 0, else repeats forever
     profiling_frequency: int = 10, # Profiling frequency in steps.  Only used if repeat == 0, in which case wait_steps will be set to profiling_frequency - (warmup_steps + active_steps) such that the effective cycle length == profiling_frequency
     max_steps: int = -1, # Max number of training steps (in units of batches) per epoch. -1 means no max_steps, otherwise training loop breaks after `max_steps` each epoch.
+    # Eval args
+    eval_every_steps: int = 0, # Run validation every N optimizer steps. 0 disables validation.
+    eval_samples: int = 256, # Number of eval samples to use when building the eval dataloader
 ):
     """
     Train a model with FSDP and QLoRA/QDoRA.
@@ -1318,6 +1321,8 @@ def fsdp_qlora(
         entity: For wandb logging
         n_bits: passed to hqq
         profiling_output: Output file for profiling
+        eval_every_steps: Validation frequency in optimizer steps (0 disables)
+        eval_samples: Number of samples to evaluate on
     """
 
     # Set world size
@@ -1416,5 +1421,7 @@ def main(
     repeat: int = 0, #Number of profiler cycles (wait + warmup + active) if > 0, else repeats forever
     profiling_frequency: int = 10, # Profiling frequency in steps.  Only used if repeat == 0, in which case wait_steps will be set to profiling_frequency - (warmup_steps + active_steps) such that the effective cycle length == profiling_frequency
     max_steps: int = -1, # Max number of training steps (in units of batches) per epoch. -1 means no max_steps, otherwise training loop breaks after `max_steps` each epoch.
+    eval_every_steps: int = 0, # Run validation every N optimizer steps. 0 disables validation.
+    eval_samples: int = 256, # Number of eval samples to use when building the eval dataloader
 ):
     fsdp_qlora(**locals())
