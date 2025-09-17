@@ -48,6 +48,7 @@ from safetensors.torch import save_file
 
 # Torch + distributed training
 from torch import Tensor, nn
+from torch.amp import autocast as torch_autocast
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
@@ -70,9 +71,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm.auto import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.optimization import get_linear_schedule_with_warmup
-from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast, get_scheduler
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, hub
 
 try:
@@ -224,6 +223,20 @@ def n_loading_workers(quant_method:str, param_count:float):
     left = int(os.cpu_count()/torch.cuda.device_count())
     right = int((4 if quant_method == "hqq" else 8) * (devprops.total_memory/1e9/40) * (70/(param_count/1e9)))
     return min(left, right)
+
+
+def set_attn_implementation(config: AutoConfig, attn_impl: str) -> None:
+    """Set the attention implementation on a config using the modern attribute when available."""
+    target_attr = "attn_implementation" if hasattr(config, "attn_implementation") else "_attn_implementation"
+    setattr(config, target_attr, attn_impl)
+
+
+def load_pretrained_with_attn(model_name: str, attn_impl: str, **kwargs) -> nn.Module:
+    """Load a model with the requested attention implementation, supporting legacy keyword fallback."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name, attn_implementation=attn_impl, **kwargs)
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(model_name, _attn_implementation=attn_impl, **kwargs)
 
 
 # Utilities related to model loading
@@ -569,7 +582,12 @@ def get_lr_scheduler(optimizer:optim.Optimizer, dataloader:DataLoader, gradient_
     num_training_steps = args['num_epochs'] * len(dataloader) // gradient_accumulation_steps
     num_warmup_steps = int(num_training_steps * 0.1)
     if args['lr_scheduler'] == "linear":
-        lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+        lr_scheduler = get_scheduler(
+            "linear",
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
     elif args['lr_scheduler'] == "cosine":
         lr_scheduler = get_cosine_one_cycle_scheduler(optimizer, num_warmup_steps, num_training_steps, min_lr_fraction=0.1)
     elif args['lr_scheduler'] == "constant":
@@ -577,6 +595,17 @@ def get_lr_scheduler(optimizer:optim.Optimizer, dataloader:DataLoader, gradient_
     else:
         raise NotImplementedError(f"{args['lr_scheduler']} LR scheduler not implemented yet")
     return lr_scheduler, num_training_steps
+
+
+def _should_enable_autocast(precision: str) -> bool:
+    return precision in {"fp16_autocast", "bf16_autocast", "bf16_buffers_autocast"}
+
+
+def get_autocast_context(precision: str, compute_dtype: torch.dtype):
+    """Return an autocast context manager compatible with the requested precision."""
+    if _should_enable_autocast(precision):
+        return torch_autocast(device_type="cuda", dtype=compute_dtype)
+    return nullcontext()
 
 
 # Optimizer
@@ -693,7 +722,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args["model_name"], trust_remote_code=("qwen" in args["model_name"].lower()))
+    trust_remote_code = "qwen" in args["model_name"].lower()
+    tokenizer = AutoTokenizer.from_pretrained(args["model_name"], trust_remote_code=trust_remote_code)
     tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
     # Set up dataloader
@@ -711,28 +741,27 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     if rank == 0 or args['verbose']:
         print("Creating model", rank)
     if args["train_type"] in ["full", "lora", "custom_lora"]:
+        base_load_kwargs = {
+            "use_cache": False,
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": trust_remote_code,
+        }
         if (args["low_memory"] and rank == 0) or (not args["low_memory"]):
-            model = AutoModelForCausalLM.from_pretrained(
-                args["model_name"],
-                use_cache=False,
-                torch_dtype=torch_dtype,
-                _attn_implementation=attn_impl,
-                trust_remote_code=("qwen" in args["model_name"].lower()),
-            )
+            model = load_pretrained_with_attn(args["model_name"], attn_impl, **base_load_kwargs)
             dtype = torch_dtype if args["precision"] == "bf16" else None
             model.to(dtype=dtype, device="cpu" if args["low_memory"] else rank)
         else:
-            cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=("qwen" in args["model_name"].lower()))
+            cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=trust_remote_code)
             cfg.use_cache = False
-            cfg._attn_implementation = attn_impl
+            set_attn_implementation(cfg, attn_impl)
             with init_empty_weights():
                 model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype)
             if args["precision"] == "bf16":
                 model.to(torch_dtype)
     elif args["train_type"] in ["qlora", "custom_qlora", "hqq_lora", "hqq_dora", "bnb_dora", "bnb_llama_pro", "hqq_llama_pro"]: # Our custom loading
-        cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=("qwen" in args["model_name"].lower()))
+        cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=trust_remote_code)
         cfg.use_cache = False
-        cfg._attn_implementation = attn_impl
+        set_attn_implementation(cfg, attn_impl)
         skip_modules = ["lm_head"]
 
         if args["train_type"] in ["bnb_llama_pro", "hqq_llama_pro"]:
@@ -908,6 +937,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
             if (rank!=0 and args["low_memory"]) else None, # TODO note about meta device and why we need this
         mixed_precision=mp_policy,
+        sync_module_states=False,
+        param_init_fn=None,
     )
     if rank == 0 or args['verbose']:
         print(f"Rank {rank}: Wrapped model: {torch.cuda.memory_reserved(local_rank)/2**30:.3f} GiB")
@@ -970,12 +1001,11 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
 
     # Autocast for mixed precision with fp16/bf16 compute types with fp32 params
-    if args["precision"] in ["fp16_autocast", "bf16_autocast", "bf16_buffers_autocast"]:
-        autocast = torch.cuda.amp.autocast(enabled=True, dtype=compute_dtype)
-    else:
-        autocast = nullcontext()
     scaler = ShardedGradScaler() if args["precision"] == "fp16_autocast" else None
     scale_grads = scaler is not None
+
+    def autocast_context():
+        return get_autocast_context(args["precision"], compute_dtype)
 
 
     if rank == 0:
@@ -1019,7 +1049,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
                 # Forward pass
                 with sync_context:
-                    with autocast:
+                    with autocast_context():
                         output = model(
                             batch['input_ids'].to(local_rank),
                             labels=batch['labels'].to(local_rank),
@@ -1109,7 +1139,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                         ddp_eval = torch.zeros(2, device=local_rank)
                         with torch.no_grad():
                             for batch in eval_dataloader:
-                                with (torch.cuda.amp.autocast(enabled=True, dtype=compute_dtype) if args["precision"] in ["fp16_autocast", "bf16_autocast", "bf16_buffers_autocast"] else nullcontext()):
+                                with get_autocast_context(args["precision"], compute_dtype):
                                     output = model(
                                         batch['input_ids'].to(local_rank),
                                         labels=batch['labels'].to(local_rank),
